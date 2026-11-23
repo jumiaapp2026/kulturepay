@@ -8,7 +8,6 @@ const API_BASE = "https://kulturepay.co.ke/api/v1";
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// Catch any uncaught errors so they always appear in Render logs
 process.on("unhandledRejection", (reason) => {
   console.error("[UNHANDLED_REJECTION]", reason);
 });
@@ -38,12 +37,17 @@ async function parseJsonSafe(res) {
   }
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  return fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
 async function triggerStkPush({ phone, amount, reference, stepIndex }) {
   const secretKey = process.env.KULTUREPAY_SECRET_KEY;
   if (!secretKey) {
-    const err = new Error("Missing KULTUREPAY_SECRET_KEY environment variable");
-    console.error(`[STK_ERROR] #${stepIndex} phone=${phone}:`, err.message);
-    throw err;
+    throw new Error("Missing KULTUREPAY_SECRET_KEY environment variable");
   }
 
   const headers = {
@@ -52,7 +56,6 @@ async function triggerStkPush({ phone, amount, reference, stepIndex }) {
     Accept: "application/json",
   };
 
-  // Step 1: Create payment intent
   const createPayload = {
     amount: Number(amount),
     amountMinor: Math.round(Number(amount) * 100),
@@ -65,7 +68,7 @@ async function triggerStkPush({ phone, amount, reference, stepIndex }) {
 
   console.log(`[STK_CREATE_REQ] #${stepIndex} phone=${phone} amount=${amount} ref=${createPayload.reference}`);
 
-  const createRes = await fetch(`${API_BASE}/payment_intents`, {
+  const createRes = await fetchWithTimeout(`${API_BASE}/payment_intents`, {
     method: "POST",
     headers,
     body: JSON.stringify(createPayload),
@@ -89,9 +92,8 @@ async function triggerStkPush({ phone, amount, reference, stepIndex }) {
   const intent = createParsed.json || {};
   console.log(`[STK_CREATE_OK] #${stepIndex} phone=${phone} intentId=${intent.id} raw=${JSON.stringify(intent)}`);
 
-  // Step 2: If KulturePay requires confirming/dispatching STK on the intent, attempt /confirm
   if (intent.id) {
-    const confirmRes = await fetch(`${API_BASE}/payment_intents/${intent.id}/confirm`, {
+    const confirmRes = await fetchWithTimeout(`${API_BASE}/payment_intents/${intent.id}/confirm`, {
       method: "POST",
       headers,
       body: JSON.stringify({ phone, phone_number: phone }),
@@ -100,7 +102,6 @@ async function triggerStkPush({ phone, amount, reference, stepIndex }) {
     const confirmParsed = await parseJsonSafe(confirmRes);
 
     if (!confirmRes.ok) {
-      // Log clearly in Render logs so you can see whether /confirm is unsupported or returned an error
       console.error(
         `[STK_CONFIRM_WARN] #${stepIndex} phone=${phone} intentId=${intent.id} status=${confirmRes.status} body=${JSON.stringify(
           confirmParsed.json ?? confirmParsed.text
@@ -128,36 +129,41 @@ app.post("/api/batch-stk", async (req, res) => {
     return res.status(401).json({ error: "Invalid dashboard password." });
   }
 
-  const cleaned = numbers
-    .map((n) => ({ raw: n, normalized: normalizeKenyanPhone(n) }))
-    .filter((item) => String(item.raw).trim() !== "");
+  const rawList = Array.isArray(numbers) ? numbers : String(numbers).split(/[\n,]+/);
+  const cleaned = rawList
+    .map((n) => ({ raw: String(n), normalized: normalizeKenyanPhone(n) }))
+    .filter((item) => item.raw.trim() !== "");
 
   if (cleaned.length === 0) {
     return res.status(400).json({ error: "No phone numbers provided." });
   }
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
+  }
 
-  let aborted = false;
+  let clientDisconnected = false;
   req.on("close", () => {
-    aborted = true;
-    console.warn("[SSE_CLIENT_CLOSED] Client disconnected during batch run");
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+      console.warn("[SSE_CLIENT_CLOSED] Client connection closed before batch finished");
+    }
   });
 
   const sendEvent = (payload) => {
-    if (!aborted) {
+    if (!clientDisconnected && !res.writableEnded) {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     }
   };
 
-  const delayMs = Math.max(4000, Number(intervalSeconds) * 1000);
+  const delayMs = Math.max(4000, Number(intervalSeconds) * 1000 || 4000);
   console.log(`[BATCH_START] count=${cleaned.length} amount=${amount} intervalMs=${delayMs}`);
 
   for (let i = 0; i < cleaned.length; i++) {
-    if (aborted) break;
-
     const stepIndex = i + 1;
     const { raw, normalized } = cleaned[i];
 
@@ -196,7 +202,7 @@ app.post("/api/batch-stk", async (req, res) => {
           message: `STK sent (${intent.payment_status || intent.status || "pending"})`,
         });
       } catch (err) {
-        console.error(`[BATCH_ITEM_ERR] #${stepIndex} phone=${normalized}:`, err);
+        console.error(`[BATCH_ITEM_ERR] #${stepIndex} phone=${normalized}:`, err.message);
         sendEvent({
           index: stepIndex,
           total: cleaned.length,
@@ -207,14 +213,16 @@ app.post("/api/batch-stk", async (req, res) => {
       }
     }
 
-    if (i < cleaned.length - 1 && !aborted) {
+    if (i < cleaned.length - 1) {
       await sleep(delayMs);
     }
   }
 
   console.log("[BATCH_DONE]");
   sendEvent({ done: true });
-  res.end();
+  if (!res.writableEnded) {
+    res.end();
+  }
 });
 
 app.post("/api/webhook/kulturepay", (req, res) => {

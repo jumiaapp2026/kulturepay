@@ -138,14 +138,20 @@
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
           const parts = buffer.split("\n\n");
           buffer = parts.pop();
 
           for (const part of parts) {
-            if (!part.startsWith("data: ")) continue;
-            const event = JSON.parse(part.slice(6));
+            const dataLines = part
+              .split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.replace(/^data:\s?/, ""));
+
+            if (dataLines.length === 0) continue;
+
+            const event = JSON.parse(dataLines.join("\n"));
             if (event.done) {
               appendLog("Batch completed.", "sent");
             } else {
